@@ -264,6 +264,18 @@ def draw_minimap(
                 color = cfg.MINIMAP_COVER
             elif ch == "2":
                 color = cfg.MINIMAP_BUILDING_B
+            elif ch == "4":
+                color = cfg.MINIMAP_PROP_CAR
+            elif ch == "5":
+                color = cfg.MINIMAP_PROP_CRATE
+            elif ch == "6":
+                color = cfg.MINIMAP_PROP_BARRIER
+            elif ch == "7":
+                color = cfg.MINIMAP_PROP_LAMP
+            elif ch == "8":
+                color = cfg.MINIMAP_PROP_DUMPSTER
+            elif ch == "9":
+                color = cfg.MINIMAP_PROP_PARAPET
             else:
                 color = cfg.MINIMAP_WALL
             pygame.draw.rect(surface, color, (base_x + i * cell, base_y + j * cell, cell, cell))

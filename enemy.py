@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import pygame
 
 import assets
+import enemy_ai
 import enemy_types as et
 import runtime as R
 import settings as cfg
@@ -33,6 +34,9 @@ class Enemy:
     ai_state: int
     combat_scale: float = 1.0
     hit_flash_timer: float = 0.0
+    patrol_ox: float = 0.0
+    patrol_oy: float = 0.0
+    strafe_phase: float = 0.0
 
     def spec(self) -> et.EnemyTypeSpec:
         return et.get_spec(self.type_key)
@@ -49,6 +53,7 @@ def create_enemy(
     sp = et.get_spec(type_key)
     hp_mult = cfg.wave_hp_multiplier(wave_number)
     d_mult = cfg.wave_damage_multiplier(wave_number)
+    calm = cfg.ENEMY_ST_PATROL if sp.prefers_patrol_when_calm else cfg.ENEMY_ST_IDLE
     return Enemy(
         type_key=type_key,
         x=x,
@@ -56,9 +61,12 @@ def create_enemy(
         wander_heading=rng.uniform(0, 2 * math.pi),
         hp=sp.max_hp * hp_mult,
         shoot_cd=rng.uniform(0, sp.shoot_cooldown * 0.9),
-        ai_state=cfg.ENEMY_ST_IDLE,
+        ai_state=calm,
         combat_scale=d_mult,
         hit_flash_timer=0.0,
+        patrol_ox=x,
+        patrol_oy=y,
+        strafe_phase=rng.uniform(0, 2 * math.pi),
     )
 
 
@@ -73,6 +81,10 @@ def to_save_dict(e: Enemy) -> dict:
         "cd": e.shoot_cd,
         "ai": e.ai_state,
         "cs": e.combat_scale,
+        "ai_mode": "v2",
+        "pox": e.patrol_ox,
+        "poy": e.patrol_oy,
+        "sf": e.strafe_phase,
     }
 
 
@@ -83,28 +95,53 @@ def from_save_obj(raw) -> Enemy:
       - list of 6 numbers (legacy v1 Grunt-only rows)
     """
     if isinstance(raw, dict):
+        px = float(raw["x"])
+        py = float(raw["y"])
+        ai = int(raw["ai"])
+        if raw.get("ai_mode") != "v2":
+            if ai == 0:
+                ai = cfg.ENEMY_ST_PATROL
+            elif ai == 1:
+                ai = cfg.ENEMY_ST_CHASE
+            elif ai == 2:
+                ai = cfg.ENEMY_ST_ATTACK
         return Enemy(
             type_key=str(raw.get("type", et.DEFAULT_TYPE_KEY)),
-            x=float(raw["x"]),
-            y=float(raw["y"]),
+            x=px,
+            y=py,
             wander_heading=float(raw["w"]),
             hp=float(raw["hp"]),
             shoot_cd=float(raw["cd"]),
-            ai_state=int(raw["ai"]),
+            ai_state=ai,
             combat_scale=float(raw.get("cs", 1.0)),
             hit_flash_timer=0.0,
+            patrol_ox=float(raw.get("pox", px)),
+            patrol_oy=float(raw.get("poy", py)),
+            strafe_phase=float(raw.get("sf", 0.0)),
         )
     if isinstance(raw, (list, tuple)) and len(raw) >= 6:
+        px = float(raw[0])
+        py = float(raw[1])
+        ai = int(raw[5])
+        if ai == 0:
+            ai = cfg.ENEMY_ST_PATROL
+        elif ai == 1:
+            ai = cfg.ENEMY_ST_CHASE
+        elif ai == 2:
+            ai = cfg.ENEMY_ST_ATTACK
         return Enemy(
             type_key=et.DEFAULT_TYPE_KEY,
-            x=float(raw[0]),
-            y=float(raw[1]),
+            x=px,
+            y=py,
             wander_heading=float(raw[2]),
             hp=float(raw[3]),
             shoot_cd=float(raw[4]),
-            ai_state=int(raw[5]),
+            ai_state=ai,
             combat_scale=1.0,
             hit_flash_timer=0.0,
+            patrol_ox=px,
+            patrol_oy=py,
+            strafe_phase=0.0,
         )
     raise ValueError(f"Bad enemy save data: {raw!r}")
 
@@ -127,7 +164,7 @@ def update_shooting(enemies, px, py, dt, tile_size, apply_damage: bool = True):
     dmg = 0.0
     for e in enemies:
         sp = e.spec()
-        if e.ai_state != cfg.ENEMY_ST_ATTACKING:
+        if e.ai_state != cfg.ENEMY_ST_ATTACK:
             e.shoot_cd = max(0.0, e.shoot_cd - dt)
             continue
         e.shoot_cd = max(0.0, e.shoot_cd - dt)
@@ -142,61 +179,8 @@ def update_shooting(enemies, px, py, dt, tile_size, apply_damage: bool = True):
     return dmg
 
 
-def _try_slide(ex, ey, mx, my, step, tile_size):
-    for scale in (1.0, 0.55, 0.28):
-        s = step * scale
-        nx = ex + mx * s
-        ny = ey + my * s
-        if world.can_walk_world(nx, ny, tile_size):
-            return nx, ny
-        if world.can_walk_world(nx, ey, tile_size):
-            return nx, ey
-        if world.can_walk_world(ex, ny, tile_size):
-            return ex, ny
-    return ex, ey
-
-
 def update_ai(enemies, px, py, dt, tile_size):
-    for e in enemies:
-        sp = e.spec()
-        dx = px - e.x
-        dy = py - e.y
-        dist_sq = dx * dx + dy * dy
-        if dist_sq < 1e-8:
-            continue
-        dist = math.sqrt(dist_sq)
-
-        st = e.ai_state
-        if dist > cfg.ENEMY_LOST_RANGE:
-            st = cfg.ENEMY_ST_IDLE
-        elif st == cfg.ENEMY_ST_IDLE:
-            if dist <= cfg.ENEMY_DETECT_RANGE:
-                st = cfg.ENEMY_ST_CHASING
-        elif st == cfg.ENEMY_ST_CHASING:
-            if dist <= cfg.ENEMY_ATTACK_RANGE:
-                st = cfg.ENEMY_ST_ATTACKING
-        elif st == cfg.ENEMY_ST_ATTACKING:
-            if dist > cfg.ENEMY_ATTACK_LEAVE_RANGE:
-                st = cfg.ENEMY_ST_CHASING
-        e.ai_state = st
-
-        if e.ai_state == cfg.ENEMY_ST_ATTACKING:
-            continue
-
-        if dist < cfg.ENEMY_MIN_MOVE_DIST:
-            continue
-
-        step = sp.speed * dt
-        if e.ai_state == cfg.ENEMY_ST_CHASING:
-            move_ang = math.atan2(dy, dx)
-        else:
-            e.wander_heading += random.uniform(-cfg.ENEMY_WANDER_TURN_MAX, cfg.ENEMY_WANDER_TURN_MAX) * dt
-            move_ang = e.wander_heading
-
-        mx = math.cos(move_ang)
-        my = math.sin(move_ang)
-        nx, ny = _try_slide(e.x, e.y, mx, my, step, tile_size)
-        e.x, e.y = nx, ny
+    enemy_ai.tick(enemies, px, py, dt, tile_size)
 
 
 def update_hit_flash(enemies, dt):

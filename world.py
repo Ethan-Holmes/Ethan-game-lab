@@ -1,6 +1,8 @@
 """
-Urban arena map: tile-based grid with roads, sidewalks, lots, buildings, alleys, and cover.
-Chunks cache cell characters; raycasting and movement treat non-walkable cells as solid.
+Urban arena map: tile-based grid with roads, sidewalks, lots, buildings, cover, and props.
+
+Cell chars: 0/a/b walkable; 1/2 buildings; 3 corner cover; 4 car; 5 crates; 6 barrier;
+7 lamp; 8 dumpster; 9 parapet façade. Chunks cache characters; non-walkable cells are solid.
 """
 
 import math
@@ -12,6 +14,76 @@ import settings as cfg
 
 # Walkable terrain (movement, bullets, LOS through these floor types).
 _WALKABLE = frozenset({"0", "a", "b"})
+
+def _is_main_road_cell(mx, my, rg):
+    """Thoroughfare grid lines — kept clear so movement stays fluid."""
+    return (mx % rg == 0) or (my % rg == 0)
+
+
+def _apply_env_props(mx, my, base, rg, ix, iy):
+    """
+    Place props on walkable terrain: sidewalks, lots, and alleys — not on main road lines.
+    Deterministic from world seed for stable saves and chunk streaming.
+    """
+    if base not in _WALKABLE:
+        return base
+    if base == "0" and _is_main_road_cell(mx, my, rg):
+        return "0"
+
+    h = _mix_u32(mx, my, int(R.world_gen_seed), 0xD0DEC0)
+    h2 = _mix_u32(mx * 31 + 7, my * 17 + 3, int(R.world_gen_seed), 0xC0DEEF)
+    h3 = _mix_u32(mx + 999, my + 333, int(R.world_gen_seed), 0xA11E00)
+
+    # Sidewalks: curb parking, street furniture, cover
+    if base == "a":
+        if (h & 0xFF) < 14:
+            return "4"
+        if (h & 0xFF) < 28:
+            return "7"
+        if (h & 0xFF) < 40:
+            return "8"
+        if (h & 0xFF) < 50:
+            return "6"
+        return "a"
+
+    # Open lots: staging, crates, barriers
+    if base == "b":
+        if (h2 & 0xFF) < 48:
+            return "5"
+        if (h2 & 0xFF) < 62:
+            return "6"
+        if (h2 & 0xFF) < 74:
+            return "8"
+        if (h2 & 0xFF) < 82:
+            return "4"
+        return "b"
+
+    # Alley / interior walkable road (not main grid): tighter combat lanes
+    if base == "0":
+        if (h3 & 0xFF) < 20:
+            return "5"
+        if (h3 & 0xFF) < 34:
+            return "8"
+        if (h3 & 0xFF) < 48:
+            return "6"
+        if (h3 & 0xFF) < 62:
+            return "7"
+        return "0"
+
+    return base
+
+
+def _facade_parapet(mx, my, base, rg, ix, iy):
+    """Some outward-facing building cells read as parapet / roofline (visual only, still solid)."""
+    if base not in ("1", "2"):
+        return base
+    on_face = ix == 2 or ix == rg - 2 or iy == 2 or iy == rg - 2
+    if not on_face:
+        return base
+    hp = _mix_u32(mx, my, int(R.world_gen_seed), 0x9A9A9E)
+    if ((hp >> 9) & 7) <= 2:
+        return "9"
+    return base
 
 
 def init_perlin_noise(seed):
@@ -36,17 +108,18 @@ def is_walkable_cell(ch):
 
 def urban_cell(mx, my):
     """
-    Deterministic city block: major roads, sidewalks, building shells, courtyards,
-    alley cuts, and optional corner cover props (same collision as walls).
+    Deterministic city block: roads, sidewalks, shells, lots, alleys, cover,
+    environmental props, and occasional façade parapet detail.
     """
     rg = cfg.URBAN_ROAD_SPACING
-    if mx % rg == 0 or my % rg == 0:
-        return "0"
-
     ix = mx % rg
     iy = my % rg
+
+    if mx % rg == 0 or my % rg == 0:
+        return _apply_env_props(mx, my, "0", rg, ix, iy)
+
     if ix == 1 or ix == rg - 1 or iy == 1 or iy == rg - 1:
-        return "a"
+        return _apply_env_props(mx, my, "a", rg, ix, iy)
 
     bx = mx // rg
     by = my // rg
@@ -54,26 +127,28 @@ def urban_cell(mx, my):
     h2 = _mix_u32(bx + 31, by + 17, int(R.world_gen_seed), 0xBEEF00)
 
     if not (2 <= ix <= rg - 2 and 2 <= iy <= rg - 2):
-        return "1" if (h & 0x200) == 0 else "2"
+        base = "1" if (h & 0x200) == 0 else "2"
+        return _facade_parapet(mx, my, base, rg, ix, iy)
 
     alley_v = (h >> 16) & 3 == 0
     alley_h = (h2 >> 16) & 3 == 0
     vx = 2 if (h & 1) == 0 else rg - 2
     vy = 2 if (h2 & 1) == 0 else rg - 2
     if alley_v and ix == vx:
-        return "0"
+        return _apply_env_props(mx, my, "0", rg, ix, iy)
     if alley_h and iy == vy:
-        return "0"
+        return _apply_env_props(mx, my, "0", rg, ix, iy)
 
     mid = rg // 2
     if ix == mid and iy == mid:
-        return "b"
+        return _apply_env_props(mx, my, "b", rg, ix, iy)
 
     corners = ((2, 2), (2, rg - 2), (rg - 2, 2), (rg - 2, rg - 2))
     if (ix, iy) in corners and ((h >> 8) & 3) < 2:
         return "3"
 
-    return "1" if (h & 0x100) == 0 else "2"
+    base = "1" if (h & 0x100) == 0 else "2"
+    return _facade_parapet(mx, my, base, rg, ix, iy)
 
 
 def generate_chunk_grid(chunk_x, chunk_y):
@@ -283,6 +358,18 @@ def _wall_base_rgb(wall_char):
         return (148, 136, 124)
     if wall_char == "3":
         return (72, 78, 88)
+    if wall_char == "4":
+        return (58, 62, 78)
+    if wall_char == "5":
+        return (108, 78, 52)
+    if wall_char == "6":
+        return (132, 128, 118)
+    if wall_char == "7":
+        return (44, 46, 54)
+    if wall_char == "8":
+        return (52, 74, 56)
+    if wall_char == "9":
+        return (118, 120, 128)
     return cfg.WALL_COLOR_BASE
 
 
@@ -304,6 +391,56 @@ def wall_color(mx, my, side, hit_x, hit_y, tile_size, distance_shade, wall_char=
         win = 0.92 + 0.08 * (1 if int(u * 5) % 2 == 0 else 0)
         band *= win
     elif wall_char == "3":
+        band *= 0.94 + 0.06 * (1 if int(u * 4) % 2 == 0 else 0)
+    elif wall_char == "4":
+        # Sedan: glass band, roof, wheel wells (blocky)
+        if 0.2 < u < 0.48:
+            band *= 1.18
+            br = min(255, br + 28)
+            bg = min(255, bg + 26)
+            bb = min(255, bb + 32)
+        elif u < 0.18 or u > 0.82:
+            band *= 0.78
+        mid = abs(u - 0.5)
+        if mid < 0.08:
+            band *= 0.92
+    elif wall_char == "5":
+        # Stacked wood / cargo crates
+        plank = int(u * 6.0) % 2
+        band *= 0.88 + 0.14 * plank
+        br = min(255, br + plank * 12)
+    elif wall_char == "6":
+        # Jersey barrier: diagonal hazard feel via stepped bands
+        stripe = (int(u * 9) + int(mx * 3 + my * 5)) % 2
+        band *= 0.9 + 0.12 * stripe
+        if stripe:
+            br = min(255, br + 40)
+            bg = min(255, bg + 36)
+    elif wall_char == "7":
+        # Lamp post: dark shaft, bright fixture cap
+        if u < 0.72:
+            band *= 0.85
+        else:
+            band *= 1.35
+            br = min(255, br + 55)
+            bg = min(255, bg + 52)
+            bb = min(255, bb + 40)
+        if 0.45 < u < 0.52:
+            band *= 0.75
+    elif wall_char == "8":
+        # Dumpster: panels + rust
+        rust = int(u * 5) % 2
+        band *= 0.9 + 0.1 * rust
+        if rust:
+            br = min(255, br + 22)
+            bg = min(255, bg + 10)
+    elif wall_char == "9":
+        # Parapet / coping: heavier top band
+        if u < 0.22:
+            band *= 1.12
+            br, bg, bb = br + 8, bg + 8, bb + 10
+        elif u > 0.78:
+            band *= 0.88
         band *= 0.94 + 0.06 * (1 if int(u * 4) % 2 == 0 else 0)
     r = max(0, min(255, int(br * band * distance_shade)))
     g = max(0, min(255, int(bg * band * distance_shade)))
@@ -458,7 +595,12 @@ def draw_raycast_view(
                 px_line = x1 - 1
                 pygame.draw.line(surface, cfg.OUTLINE_COLOR, (px_line, y0), (px_line, y1), cfg.OUTLINE_WIDTH)
 
-        if tex is None and cfg.WALL_BANDS > 1 and line_h > cfg.WALL_BANDS * 3:
+        if (
+            tex is None
+            and wall_char in ("1", "2", "3", "9")
+            and cfg.WALL_BANDS > 1
+            and line_h > cfg.WALL_BANDS * 3
+        ):
             for b in range(1, cfg.WALL_BANDS):
                 y = top + (b * line_h) // cfg.WALL_BANDS
                 pygame.draw.line(

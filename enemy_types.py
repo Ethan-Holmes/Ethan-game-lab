@@ -25,7 +25,7 @@ class EnemyTypeSpec:
     max_hp: float
     speed: float  # world pixels per second (movement)
     ranged_damage: float  # damage per shot to the player
-    shoot_cooldown: float  # seconds between shots (when in ATTACKING)
+    shoot_cooldown: float  # seconds between shots (when in ATTACK)
     contact_dps: float  # damage per second when touching the player
     billboard_width: float  # world units (same meaning as old ENEMY_SPRITE_WIDTH)
     billboard_height: float
@@ -34,6 +34,18 @@ class EnemyTypeSpec:
     placeholder_edge: tuple
     # Optional: path under assets/ (e.g. "enemies/grunt.png"). None = placeholder only.
     sprite_file: str | None = None
+    # --- Rule-based AI (see enemy_ai.py; multipliers apply to settings.ENEMY_* ranges) ---
+    prefers_patrol_when_calm: bool = True  # False = idle hold at anchor when no target
+    detect_range_mult: float = 1.0
+    lost_range_mult: float = 1.0
+    attack_range_mult: float = 1.0
+    attack_leave_range_mult: float = 1.0
+    patrol_radius: float = 155.0  # max wander distance from patrol anchor
+    patrol_wander_mult: float = 1.0  # scales idle/patrol turn jitter
+    separation_radius: float = 92.0  # push away from allies within this distance
+    separation_weight: float = 0.9  # how strongly separation steers vs goal
+    attack_standoff_min_frac: float = 0.36  # of ENEMY_SHOOT_RANGE — too close → back up
+    attack_standoff_max_frac: float = 0.88  # too far in attack band → inch in
 
 
 # Baseline tuned from the original single enemy type (roughly a Grunt).
@@ -52,6 +64,12 @@ TYPES: Dict[str, EnemyTypeSpec] = {
         placeholder_fill=(200, 60, 55),
         placeholder_edge=(90, 30, 28),
         sprite_file="enemies/grunt.png",
+        prefers_patrol_when_calm=True,
+        detect_range_mult=1.0,
+        patrol_radius=150.0,
+        separation_radius=90.0,
+        attack_standoff_min_frac=0.38,
+        attack_standoff_max_frac=0.86,
     ),
     TYPE_HEAVY: EnemyTypeSpec(
         key=TYPE_HEAVY,
@@ -67,6 +85,17 @@ TYPES: Dict[str, EnemyTypeSpec] = {
         placeholder_fill=(95, 75, 175),
         placeholder_edge=(45, 35, 95),
         sprite_file="enemies/heavy.png",
+        prefers_patrol_when_calm=False,
+        detect_range_mult=0.92,
+        lost_range_mult=0.95,
+        attack_range_mult=0.88,
+        attack_leave_range_mult=0.92,
+        patrol_radius=72.0,
+        patrol_wander_mult=0.4,
+        separation_radius=108.0,
+        separation_weight=1.15,
+        attack_standoff_min_frac=0.22,
+        attack_standoff_max_frac=0.62,
     ),
     TYPE_SCOUT: EnemyTypeSpec(
         key=TYPE_SCOUT,
@@ -82,6 +111,16 @@ TYPES: Dict[str, EnemyTypeSpec] = {
         placeholder_fill=(55, 185, 115),
         placeholder_edge=(25, 95, 60),
         sprite_file="enemies/scout.png",
+        prefers_patrol_when_calm=True,
+        detect_range_mult=1.18,
+        lost_range_mult=1.0,
+        attack_range_mult=1.0,
+        patrol_radius=205.0,
+        patrol_wander_mult=1.35,
+        separation_radius=68.0,
+        separation_weight=0.65,
+        attack_standoff_min_frac=0.48,
+        attack_standoff_max_frac=0.94,
     ),
 }
 
