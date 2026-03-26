@@ -2,6 +2,7 @@
 Enemy entities: AI, shooting, and 3D billboards.
 
 Each enemy is an `Enemy` row with a `type_key` into `enemy_types.TYPES` (Grunt, Heavy, Scout, …).
+AI states: idle, patrol, chase, attack, search (see settings.ENEMY_ST_* and enemy_ai).
 To add a new class, define it in enemy_types.py and optional assets/<sprite_file>.
 """
 
@@ -37,6 +38,12 @@ class Enemy:
     patrol_ox: float = 0.0
     patrol_oy: float = 0.0
     strafe_phase: float = 0.0
+    last_seen_px: float = 0.0
+    last_seen_py: float = 0.0
+    search_timer: float = 0.0
+    acquire_delay: float = 0.0
+    acquire_delay_reset: float = 0.25
+    is_elite: bool = False
 
     def spec(self) -> et.EnemyTypeSpec:
         return et.get_spec(self.type_key)
@@ -48,17 +55,30 @@ def create_enemy(
     y: float,
     rng: random.Random,
     wave_number: int = 1,
+    player_x: float | None = None,
+    player_y: float | None = None,
+    elite: bool = False,
 ) -> Enemy:
     """Spawn with wave-scaled HP and outgoing damage (combat_scale)."""
     sp = et.get_spec(type_key)
     hp_mult = cfg.wave_hp_multiplier(wave_number)
     d_mult = cfg.wave_damage_multiplier(wave_number)
+    if elite:
+        hp_mult *= 1.14
+        d_mult *= 1.07
     calm = cfg.ENEMY_ST_PATROL if sp.prefers_patrol_when_calm else cfg.ENEMY_ST_IDLE
+    if player_x is not None and player_y is not None:
+        ang = math.atan2(player_y - y, player_x - x) + rng.uniform(-0.52, 0.52)
+        wander_heading = ang
+    else:
+        wander_heading = rng.uniform(0, 2 * math.pi)
+    ad_max = min(cfg.ENEMY_ALERT_DELAY_MAX, sp.spawn_alert_delay_max)
+    aq_reset = rng.uniform(0.06, 0.06 + ad_max)
     return Enemy(
         type_key=type_key,
         x=x,
         y=y,
-        wander_heading=rng.uniform(0, 2 * math.pi),
+        wander_heading=wander_heading,
         hp=sp.max_hp * hp_mult,
         shoot_cd=rng.uniform(0, sp.shoot_cooldown * 0.9),
         ai_state=calm,
@@ -67,6 +87,12 @@ def create_enemy(
         patrol_ox=x,
         patrol_oy=y,
         strafe_phase=rng.uniform(0, 2 * math.pi),
+        last_seen_px=x,
+        last_seen_py=y,
+        search_timer=0.0,
+        acquire_delay=aq_reset,
+        acquire_delay_reset=aq_reset,
+        is_elite=elite,
     )
 
 
@@ -81,10 +107,16 @@ def to_save_dict(e: Enemy) -> dict:
         "cd": e.shoot_cd,
         "ai": e.ai_state,
         "cs": e.combat_scale,
-        "ai_mode": "v2",
+        "ai_mode": "v3",
         "pox": e.patrol_ox,
         "poy": e.patrol_oy,
         "sf": e.strafe_phase,
+        "lsx": e.last_seen_px,
+        "lsy": e.last_seen_py,
+        "srch": e.search_timer,
+        "aqd": e.acquire_delay,
+        "aqr": e.acquire_delay_reset,
+        "el": 1 if e.is_elite else 0,
     }
 
 
@@ -98,13 +130,20 @@ def from_save_obj(raw) -> Enemy:
         px = float(raw["x"])
         py = float(raw["y"])
         ai = int(raw["ai"])
-        if raw.get("ai_mode") != "v2":
+        mode = raw.get("ai_mode", "v2")
+        if mode not in ("v2", "v3"):
             if ai == 0:
                 ai = cfg.ENEMY_ST_PATROL
             elif ai == 1:
                 ai = cfg.ENEMY_ST_CHASE
             elif ai == 2:
                 ai = cfg.ENEMY_ST_ATTACK
+        elif mode == "v2" and ai == cfg.ENEMY_ST_SEARCH:
+            ai = cfg.ENEMY_ST_CHASE
+        lsx = float(raw.get("lsx", px))
+        lsy = float(raw.get("lsy", py))
+        aqr = float(raw.get("aqr", 0.25))
+        elite = bool(raw.get("el", 0)) or bool(raw.get("elite", False))
         return Enemy(
             type_key=str(raw.get("type", et.DEFAULT_TYPE_KEY)),
             x=px,
@@ -118,6 +157,12 @@ def from_save_obj(raw) -> Enemy:
             patrol_ox=float(raw.get("pox", px)),
             patrol_oy=float(raw.get("poy", py)),
             strafe_phase=float(raw.get("sf", 0.0)),
+            last_seen_px=lsx,
+            last_seen_py=lsy,
+            search_timer=float(raw.get("srch", 0.0)),
+            acquire_delay=float(raw.get("aqd", aqr)),
+            acquire_delay_reset=aqr,
+            is_elite=elite,
         )
     if isinstance(raw, (list, tuple)) and len(raw) >= 6:
         px = float(raw[0])
@@ -142,8 +187,33 @@ def from_save_obj(raw) -> Enemy:
             patrol_ox=px,
             patrol_oy=py,
             strafe_phase=0.0,
+            last_seen_px=px,
+            last_seen_py=py,
+            search_timer=0.0,
+            acquire_delay=0.25,
+            acquire_delay_reset=0.25,
+            is_elite=False,
         )
     raise ValueError(f"Bad enemy save data: {raw!r}")
+
+
+def ranged_attack_telegraph_strength(ent: Enemy, px: float, py: float, tile_size: float) -> float:
+    """1 = shot about to fire; 0 = not telegraphing. Only when LOS + in gun range + ATTACK."""
+    if ent.ai_state != cfg.ENEMY_ST_ATTACK:
+        return 0.0
+    dist = math.hypot(ent.x - px, ent.y - py)
+    if dist > cfg.ENEMY_SHOOT_RANGE + 1e-6:
+        return 0.0
+    if not clear_shot_to_player(ent.x, ent.y, px, py, tile_size):
+        return 0.0
+    sp = ent.spec()
+    sec = max(
+        cfg.ENEMY_ATTACK_TELEGRAPH_SEC,
+        sp.shoot_cooldown * sp.telegraph_cooldown_frac,
+    )
+    if sec <= 0:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - ent.shoot_cd / sec))
 
 
 def clear_shot_to_player(ex, ey, px, py, tile_size):
@@ -240,8 +310,8 @@ def draw_death_effects(
         dist = math.hypot(wx - px, wy - py)
         if dist < 1e-3:
             continue
-        along_t = (wx - px) * cos_y + (wy - py) * sin_y
-        if along_t <= 0:
+        along_view = (wx - px) * cos_y + (wy - py) * sin_y
+        if along_view <= 0:
             continue
         ang = math.atan2(wy - py, wx - px)
         rel = ang - yaw
@@ -263,12 +333,18 @@ def draw_death_effects(
         a = int(200 * life)
         if sx_i < 0 or sx_i >= screen_w:
             continue
-        if along_t >= depth_at_column(sx_i):
+        ri = world.screen_column_to_ray_index(sx_i, screen_w, n)
+        r_ang = world.ray_angle_for_index(ri, n, yaw, fov)
+        d_burst = world.perpendicular_depth_along_ray(px, py, wx, wy, r_ang)
+        if d_burst <= 0 or d_burst >= depth_at_column(sx_i):
             continue
         ring = pygame.Surface((rad * 2 + 4, rad * 2 + 4), pygame.SRCALPHA)
         col = (255, 220, 120, min(220, a))
         pygame.draw.circle(ring, col, (rad + 2, rad + 2), rad, 2)
         pygame.draw.circle(ring, (255, 255, 255, min(180, a)), (rad + 2, rad + 2), max(2, rad - 3), 1)
+        inner = max(4, int(rad * 0.42 + (1.0 - life) * 10))
+        pygame.draw.circle(ring, (255, 255, 255, min(140, a)), (rad + 2, rad + 2), inner, 1)
+        pygame.draw.circle(ring, (255, 175, 85, min(85, a // 2)), (rad + 2, rad + 2), max(2, rad - 5), 1)
         surface.blit(ring, (sx_i - rad - 2, cy - rad - 2))
 
 
@@ -287,8 +363,13 @@ def draw_billboards(
     billboard_texture=None,
 ):
     """
-    Per-enemy billboard: texture from assets.billboard_for_enemy_type(type_key).
-    Pass billboard_texture only to override all (legacy); normally None.
+    Draw enemy billboards facing the camera (upright quads in screen space).
+
+    - Textures: assets.billboard_for_enemy_type (grunt / heavy / scout PNGs or typed placeholders).
+    - Scale: 1/dist perspective using type billboard size × ENEMY_BILLBOARD_SCALE.
+    - Depth sort: far enemies drawn first so nearer ones paint on top.
+    - Wall occlusion: each screen column compares sprite depth vs that column's ray hit depth
+      (perpendicular depth along the same ray as compute_ray_hits — not view-axis depth only).
     """
     if not enemies:
         return
@@ -309,13 +390,19 @@ def draw_billboards(
         d = ray_hits[i][0]
         return float("inf") if math.isinf(d) else float(d)
 
-    ordered = sorted(enemies, key=lambda t: -(math.hypot(t.x - px, t.y - py)))
+    # Painter's order: largest distance first so closer sprites overwrite farther ones.
+    ordered = sorted(
+        enemies,
+        key=lambda e: (-math.hypot(e.x - px, e.y - py), id(e)),
+    )
 
     cos_y = math.cos(yaw)
     sin_y = math.sin(yaw)
+    base_vis = cfg.ENEMY_BILLBOARD_SCALE
 
     for ent in ordered:
         sp = ent.spec()
+        vis = base_vis * sp.billboard_scale_mul
         tex_src = billboard_texture if billboard_texture is not None else assets.billboard_for_enemy_type(ent.type_key)
         if tex_src.get_width() < 1 or tex_src.get_height() < 1:
             continue
@@ -323,8 +410,9 @@ def draw_billboards(
         dist = math.hypot(ent.x - px, ent.y - py)
         if dist < 1e-3:
             continue
-        along_t = (ent.x - px) * cos_y + (ent.y - py) * sin_y
-        if along_t <= 0:
+        # Behind the camera plane (center ray) — skip whole sprite
+        along_view = (ent.x - px) * cos_y + (ent.y - py) * sin_y
+        if along_view <= 0:
             continue
 
         ang = math.atan2(ent.y - py, ent.x - px)
@@ -337,9 +425,9 @@ def draw_billboards(
             continue
 
         sx = screen_w / 2 + math.tan(rel) * proj_plane
-        line_h = int((sp.billboard_height * proj_plane) / dist)
+        line_h = int((sp.billboard_height * vis * proj_plane) / dist)
         line_h = min(max(line_h, 2), screen_h * 2)
-        half_w = int((sp.billboard_width * proj_plane) / dist / 2)
+        half_w = int((sp.billboard_width * vis * proj_plane) / dist / 2)
         half_w = max(half_w, 1)
         left = int(sx - half_w)
         right = int(sx + half_w)
@@ -348,8 +436,10 @@ def draw_billboards(
         scaled = pygame.transform.smoothscale(tex_src, (sprite_screen_w, line_h))
         sw = scaled.get_width()
 
-        shade = max(0.35, 1.0 - 0.65 * min(dist / cfg.MAX_SHADE_DISTANCE, 1.0))
+        tdist = min(1.0, dist / max(1e-6, cfg.ENEMY_BILLBOARD_SHADE_DISTANCE))
+        shade = cfg.ENEMY_BILLBOARD_SHADE_MAX + (cfg.ENEMY_BILLBOARD_SHADE_MIN - cfg.ENEMY_BILLBOARD_SHADE_MAX) * tdist
         ds = max(0, min(255, int(255 * shade)))
+        lift = cfg.ENEMY_BILLBOARD_SHADOW_LIFT
 
         any_vis = False
         outline_top = None
@@ -357,7 +447,13 @@ def draw_billboards(
         for col in range(left, right):
             if col < 0 or col >= screen_w:
                 continue
-            if along_t >= depth_at_column(col):
+            ri = world.screen_column_to_ray_index(col, screen_w, n)
+            ray_ang = world.ray_angle_for_index(ri, n, yaw, fov)
+            d_sprite = world.perpendicular_depth_along_ray(px, py, ent.x, ent.y, ray_ang)
+            if d_sprite <= 0:
+                continue
+            wall_d = depth_at_column(col)
+            if not math.isinf(wall_d) and d_sprite >= wall_d:
                 continue
             lx = col - left
             if lx < 0 or lx >= sw:
@@ -373,15 +469,36 @@ def draw_billboards(
             strip = scaled.subsurface((lx, 0, 1, line_h))
             strip = strip.copy()
             strip.fill((ds, ds, ds), special_flags=pygame.BLEND_MULT)
+            strip.fill(lift, special_flags=pygame.BLEND_ADD)
             if ent.hit_flash_timer > 0:
                 hf = min(1.0, ent.hit_flash_timer / max(1e-6, cfg.ENEMY_HIT_FLASH_DURATION))
                 add_amt = int(70 * hf)
                 strip.fill((add_amt, add_amt // 3, add_amt // 5), special_flags=pygame.BLEND_ADD)
+            te = ranged_attack_telegraph_strength(ent, px, py, cfg.TILE_SIZE)
+            if te > 0:
+                wr, wg, wb = sp.attack_telegraph_rgb
+                k = 52 * te
+                strip.fill(
+                    (int(k * wr / 255), int(k * wg / 255), int(k * wb / 255)),
+                    special_flags=pygame.BLEND_ADD,
+                )
+            if ent.ai_state == cfg.ENEMY_ST_SEARCH:
+                strip.fill((28, 48, 72), special_flags=pygame.BLEND_ADD)
             surface.blit(strip, (col, top))
         if any_vis and outline_top is not None and outline_bot is not None:
+            bw = max(1, right - left)
+            bh = outline_bot - outline_top
+            rw = max(1, cfg.ENEMY_BILLBOARD_RIM_WIDTH)
+            rim = cfg.ENEMY_SEARCH_RIM_COLOR if ent.ai_state == cfg.ENEMY_ST_SEARCH else cfg.ENEMY_BILLBOARD_RIM_COLOR
+            pygame.draw.rect(
+                surface,
+                rim,
+                (left - 1, outline_top - 1, bw + 2, bh + 2),
+                rw,
+            )
             pygame.draw.rect(
                 surface,
                 sp.placeholder_edge,
-                (left, outline_top, max(1, right - left), outline_bot - outline_top),
+                (left, outline_top, bw, bh),
                 1,
             )

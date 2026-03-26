@@ -14,6 +14,9 @@ import sprite_loader
 WALL_TEXTURES = {}
 SOUND_GUNSHOT = None
 SOUND_HIT = None
+SOUND_AMBIENT_WIND = None
+SOUND_AMBIENT_TRAFFIC = None
+SOUND_AMBIENT_INDUSTRIAL = None
 # Full-body player art at CHARACTER_SPRITE_BASE_SIZE (minimap scales from this).
 PLAYER_CHARACTER_SPRITE = None
 PLAYER_MINIMAP_SPRITE = None
@@ -64,6 +67,20 @@ def _load_wall_textures(assets_dir):
         out["2"] = out["1"]
     if out.get("3") is None and out.get("1") is not None:
         out["3"] = out["1"]
+    if out.get("u") is None and out.get("3") is not None:
+        out["u"] = out["3"]
+    for key, fallback in (
+        ("D", "2"),
+        ("L", "1"),
+        ("W", "3"),
+        ("M", "3"),
+        ("T", "3"),
+        ("K", "3"),
+        ("E", "1"),
+        ("S", "1"),
+    ):
+        if out.get(key) is None and out.get(fallback) is not None:
+            out[key] = out[fallback]
     return out
 
 
@@ -194,17 +211,45 @@ def billboard_for_enemy_type(type_key):
 def load_all(assets_dir):
     """Call once after pygame.init() and display mode are set. Fills module-level surfaces."""
     global WALL_TEXTURES, SOUND_GUNSHOT, SOUND_HIT
+    global SOUND_AMBIENT_WIND, SOUND_AMBIENT_TRAFFIC, SOUND_AMBIENT_INDUSTRIAL
     global PLAYER_CHARACTER_SPRITE, PLAYER_MINIMAP_SPRITE, ENEMY_BILLBOARD_SPRITE
 
     _ensure_default_wall_assets(assets_dir)
     os.makedirs(sprite_loader.asset_path(assets_dir, cfg.PLAYER_SPRITE_DIR), exist_ok=True)
     os.makedirs(sprite_loader.asset_path(assets_dir, cfg.ENEMY_SPRITE_DIR), exist_ok=True)
+    amb_dir = os.path.join(assets_dir, "ambient")
+    try:
+        os.makedirs(amb_dir, exist_ok=True)
+    except OSError:
+        pass
     WALL_TEXTURES = _load_wall_textures(assets_dir)
     SOUND_GUNSHOT = _load_sfx_first_available(
         [os.path.join(assets_dir, "gunshot.wav"), os.path.join(assets_dir, "gunshot.mp3")]
     )
     SOUND_HIT = _load_sfx_first_available(
         [os.path.join(assets_dir, "hit.wav"), os.path.join(assets_dir, "hit.mp3")]
+    )
+
+    SOUND_AMBIENT_WIND = _load_sfx_first_available(
+        [
+            os.path.join(amb_dir, "wind.wav"),
+            os.path.join(amb_dir, "wind.ogg"),
+            os.path.join(assets_dir, "ambient_wind.wav"),
+        ]
+    )
+    SOUND_AMBIENT_TRAFFIC = _load_sfx_first_available(
+        [
+            os.path.join(amb_dir, "traffic.wav"),
+            os.path.join(amb_dir, "traffic.ogg"),
+            os.path.join(assets_dir, "ambient_traffic.wav"),
+        ]
+    )
+    SOUND_AMBIENT_INDUSTRIAL = _load_sfx_first_available(
+        [
+            os.path.join(amb_dir, "industrial.wav"),
+            os.path.join(amb_dir, "industrial.ogg"),
+            os.path.join(assets_dir, "ambient_industrial.wav"),
+        ]
     )
 
     player_paths = [

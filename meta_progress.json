@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "lifetime_kills": 2,
+  "waves_cleared_total": 0,
+  "best_wave_reached": 2,
+  "unlocked_weapon_slots": [
+    1,
+    2
+  ],
+  "bonus_start_blocks": 0,
+  "wall_tier": 0,
+  "hostile_momentum": false,
+  "claimed": []
+}

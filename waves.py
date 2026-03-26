@@ -7,17 +7,19 @@ import random
 
 import enemy
 import enemy_types as et
+import progression
 import runtime as R
 import settings as cfg
 import world
 
 
-def pick_spawn_type_for_wave(rng: random.Random, wave_n: int) -> str:
+def pick_spawn_type_for_wave(rng: random.Random, wave_n: int, pressure: float = 0.0) -> str:
     """Slightly more heavies/scouts at higher waves (still beginner-readable)."""
     t = max(0, wave_n - 1)
-    w_grunt = 0.5 - min(0.22, t * 0.034)
-    w_heavy = 0.25 + min(0.18, t * 0.022)
-    w_scout = 0.25 + min(0.18, t * 0.022)
+    p = max(0.0, min(1.0, pressure))
+    w_grunt = 0.5 - min(0.22, t * 0.034) - p * 0.1
+    w_heavy = 0.25 + min(0.18, t * 0.022) + p * 0.14
+    w_scout = 0.25 + min(0.18, t * 0.022) - p * 0.04
     s = w_grunt + w_heavy + w_scout
     w_grunt /= s
     w_heavy /= s
@@ -67,7 +69,42 @@ def _collect_spawn_cells(px, py, tile_size, num_needed, min_dist_sq, rng, max_ri
     return merged[:num_needed]
 
 
-def spawn_wave_enemies(px, py, tile_size, wave_number, rng=None):
+def _spread_spawn_cells(cells, px, py, tile_size, n, rng):
+    """Prefer spawns from different compass buckets so squads don’t stack on one bearing."""
+    if n <= 2 or len(cells) <= n:
+        rng.shuffle(cells)
+        return cells[:n]
+    buckets = [[] for _ in range(4)]
+    for mx, my in cells:
+        cx, cy = _cell_center_world(mx, my, tile_size)
+        ang = math.atan2(cy - py, cx - px)
+        q = int((ang + math.pi) / (0.5 * math.pi)) % 4
+        buckets[q].append((mx, my))
+    for b in buckets:
+        rng.shuffle(b)
+    out = []
+    q = 0
+    while len(out) < n:
+        progressed = False
+        for _ in range(4):
+            b = buckets[q % 4]
+            q += 1
+            if b:
+                out.append(b.pop())
+                progressed = True
+                break
+        if not progressed:
+            break
+    if len(out) < n:
+        rest = []
+        for b in buckets:
+            rest.extend(b)
+        rng.shuffle(rest)
+        out.extend(rest[: n - len(out)])
+    return out[:n]
+
+
+def spawn_wave_enemies(px, py, tile_size, wave_number, rng=None, spawn_style="normal"):
     """Spawn a full wave: scaled count, difficulty, and safe spawn points."""
     if rng is None:
         rng = random.Random()
@@ -75,6 +112,8 @@ def spawn_wave_enemies(px, py, tile_size, wave_number, rng=None):
         rng = random.Random()
     n = cfg.wave_enemy_count(wave_number)
     min_dist = cfg.WAVE_SPAWN_MIN_DIST
+    if spawn_style == "ambush":
+        min_dist = max(tile_size * 1.15, cfg.WAVE_SPAWN_MIN_DIST * cfg.WAVE_AMBUSH_SPAWN_DIST_MULT)
     min_dist_sq = min_dist * min_dist
     cells = _collect_spawn_cells(px, py, tile_size, n, min_dist_sq, rng)
 
@@ -84,15 +123,33 @@ def spawn_wave_enemies(px, py, tile_size, wave_number, rng=None):
     if len(cells) < n:
         cells = _collect_spawn_cells(px, py, tile_size, n, (min_dist * 0.22) ** 2, rng)
 
+    picked = _spread_spawn_cells(cells, px, py, tile_size, n, rng)
+    pressure = progression.spawn_mix_pressure()
     out = []
-    for mx, my in cells[:n]:
-        tkey = pick_spawn_type_for_wave(rng, wave_number)
+    for mx, my in picked:
+        tkey = pick_spawn_type_for_wave(rng, wave_number, pressure=pressure)
         cx, cy = _cell_center_world(mx, my, tile_size)
-        out.append(enemy.create_enemy(tkey, cx, cy, rng, wave_number=wave_number))
+        jx = cx + rng.uniform(-10.0, 10.0)
+        jy = cy + rng.uniform(-10.0, 10.0)
+        if world.can_walk_world(jx, jy, tile_size):
+            cx, cy = jx, jy
+        elite = progression.roll_elite_spawn(rng)
+        out.append(
+            enemy.create_enemy(
+                tkey,
+                cx,
+                cy,
+                rng,
+                wave_number=wave_number,
+                player_x=px,
+                player_y=py,
+                elite=elite,
+            )
+        )
     return out
 
 
-def find_spawn_and_enemies(tile_size, wave_number=1, rng=None, skip_enemies=False):
+def find_spawn_and_enemies(tile_size, wave_number=1, rng=None, skip_enemies=False, spawn_style="normal"):
     """
     Spiral from origin for a floor cell for the player.
     If skip_enemies is True (e.g. main menu), return [] for the enemy list.
@@ -123,5 +180,5 @@ def find_spawn_and_enemies(tile_size, wave_number=1, rng=None, skip_enemies=Fals
 
     if skip_enemies:
         return px, py, []
-    enemies = spawn_wave_enemies(px, py, tile_size, wave_number, rng=rng)
+    enemies = spawn_wave_enemies(px, py, tile_size, wave_number, rng=rng, spawn_style=spawn_style)
     return px, py, enemies

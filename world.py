@@ -1,81 +1,104 @@
 """
 Urban arena map: tile-based grid with roads, sidewalks, lots, buildings, cover, and props.
 
-Cell chars: 0/a/b walkable; 1/2 buildings; 3 corner cover; 4 car; 5 crates; 6 barrier;
-7 lamp; 8 dumpster; 9 parapet façade. Chunks cache characters; non-walkable cells are solid.
+Cell chars: 0/a/b/P/f walkable; 1/2/D/L/W/M buildings; 3 cover; 4 car; 5 crates; 6 barrier;
+7 lamp; 8 dumpster; 9 parapet; u utility box; T water tower; K checkpoint; E fence; S plaza statue.
+District styles and landmarks are assigned in districts.py; layout rules live in urban_cell().
+Chunks cache characters; non-walkable cells are solid.
 """
 
 import math
 
 import pygame
 
+import districts
 import runtime as R
 import settings as cfg
 
 # Walkable terrain (movement, bullets, LOS through these floor types).
-_WALKABLE = frozenset({"0", "a", "b"})
+_WALKABLE = frozenset({"0", "a", "b", "P", "f"})
 
 def _is_main_road_cell(mx, my, rg):
     """Thoroughfare grid lines — kept clear so movement stays fluid."""
     return (mx % rg == 0) or (my % rg == 0)
 
 
-def _apply_env_props(mx, my, base, rg, ix, iy):
+def _ensure_cum_increasing(cum):
+    """Keep cumulative thresholds strictly increasing after scaling (1..255)."""
+    out = []
+    prev = 0
+    for t in cum:
+        t = max(prev + 1, min(255, t))
+        out.append(t)
+        prev = t
+    return out
+
+
+def _cum_prop(x, cum, chars):
+    """First char where x < cum[i]; else None if x >= last (keep walkable base)."""
+    if not cum or x >= cum[-1]:
+        return None
+    for i, hi in enumerate(cum):
+        if x < hi:
+            return chars[i]
+    return None
+
+
+_PROP_ORDER = ("4", "7", "8", "6", "5", "u")
+
+
+def _apply_env_props(mx, my, base, rg, ix, iy, dist=None):
     """
     Place props on walkable terrain: sidewalks, lots, and alleys — not on main road lines.
     Deterministic from world seed for stable saves and chunk streaming.
+    `dist` is a districts.* id; prop mix and density follow district character.
     """
     if base not in _WALKABLE:
         return base
     if base == "0" and _is_main_road_cell(mx, my, rg):
         return "0"
 
+    if dist is None:
+        dist = districts.DIST_DOWNTOWN
+    scale = districts.env_prop_density_shift(dist)
     h = _mix_u32(mx, my, int(R.world_gen_seed), 0xD0DEC0)
     h2 = _mix_u32(mx * 31 + 7, my * 17 + 3, int(R.world_gen_seed), 0xC0DEEF)
     h3 = _mix_u32(mx + 999, my + 333, int(R.world_gen_seed), 0xA11E00)
 
     # Sidewalks: curb parking, street furniture, cover
     if base == "a":
-        if (h & 0xFF) < 14:
-            return "4"
-        if (h & 0xFF) < 28:
-            return "7"
-        if (h & 0xFF) < 40:
-            return "8"
-        if (h & 0xFF) < 50:
-            return "6"
-        return "a"
+        cum = [min(255, int(t * scale)) for t in districts.sidewalk_prop_cumulative(dist)]
+        cum = _ensure_cum_increasing(cum)
+        p = _cum_prop(h & 0xFF, cum, _PROP_ORDER)
+        return p if p is not None else "a"
 
     # Open lots: staging, crates, barriers
     if base == "b":
-        if (h2 & 0xFF) < 48:
-            return "5"
-        if (h2 & 0xFF) < 62:
-            return "6"
-        if (h2 & 0xFF) < 74:
-            return "8"
-        if (h2 & 0xFF) < 82:
-            return "4"
-        return "b"
+        cum = [min(255, int(t * scale)) for t in districts.lot_prop_cumulative(dist)]
+        cum = _ensure_cum_increasing(cum)
+        p = _cum_prop(h2 & 0xFF, cum, _PROP_ORDER)
+        return p if p is not None else "b"
+
+    # Plaza pavement: open center, light clutter
+    if base == "P":
+        cum = [min(255, int(t * scale)) for t in districts.plaza_prop_cumulative(dist)]
+        cum = _ensure_cum_increasing(cum)
+        p = _cum_prop(h2 & 0xFF, cum, _PROP_ORDER)
+        return p if p is not None else "P"
 
     # Alley / interior walkable road (not main grid): tighter combat lanes
     if base == "0":
-        if (h3 & 0xFF) < 20:
-            return "5"
-        if (h3 & 0xFF) < 34:
-            return "8"
-        if (h3 & 0xFF) < 48:
-            return "6"
-        if (h3 & 0xFF) < 62:
-            return "7"
-        return "0"
+        cum = [min(255, int(t * scale)) for t in districts.alley_road_prop_cumulative(dist)]
+        cum = _ensure_cum_increasing(cum)
+        p = _cum_prop(h3 & 0xFF, cum, _PROP_ORDER)
+        return p if p is not None else "0"
 
     return base
 
 
 def _facade_parapet(mx, my, base, rg, ix, iy):
     """Some outward-facing building cells read as parapet / roofline (visual only, still solid)."""
-    if base not in ("1", "2"):
+    if base not in ("1", "2", "D", "L", "W", "M"):
         return base
     on_face = ix == 2 or ix == rg - 2 or iy == 2 or iy == rg - 2
     if not on_face:
@@ -108,46 +131,59 @@ def is_walkable_cell(ch):
 
 def urban_cell(mx, my):
     """
-    Deterministic city block: roads, sidewalks, shells, lots, alleys, cover,
-    environmental props, and occasional façade parapet detail.
+    Deterministic city block: roads, sidewalks, district-styled shells, lots, alleys,
+    landmarks, and props. District choice: districts.district_type_at_block; rare
+    landmark footprints: districts.try_landmark_cell / try_landmark_sidewalk_cell.
     """
     rg = cfg.URBAN_ROAD_SPACING
     ix = mx % rg
     iy = my % rg
-
-    if mx % rg == 0 or my % rg == 0:
-        return _apply_env_props(mx, my, "0", rg, ix, iy)
-
-    if ix == 1 or ix == rg - 1 or iy == 1 or iy == rg - 1:
-        return _apply_env_props(mx, my, "a", rg, ix, iy)
-
     bx = mx // rg
     by = my // rg
-    h = _mix_u32(bx, by, int(R.world_gen_seed), 0xC0FFEE)
-    h2 = _mix_u32(bx + 31, by + 17, int(R.world_gen_seed), 0xBEEF00)
+    seed = int(R.world_gen_seed)
+    dist = districts.district_type_at_block(bx, by, seed)
+
+    if mx % rg == 0 or my % rg == 0:
+        return _apply_env_props(mx, my, "0", rg, ix, iy, dist)
+
+    if ix == 1 or ix == rg - 1 or iy == 1 or iy == rg - 1:
+        sw = districts.try_landmark_sidewalk_cell(bx, by, rg, ix, iy, seed)
+        if sw is not None:
+            return sw
+        return _apply_env_props(mx, my, "a", rg, ix, iy, dist)
+
+    h = _mix_u32(bx, by, seed, 0xC0FFEE)
+    h2 = _mix_u32(bx + 31, by + 17, seed, 0xBEEF00)
+    sa, sb = districts.shell_chars_for_district(dist, h)
 
     if not (2 <= ix <= rg - 2 and 2 <= iy <= rg - 2):
-        base = "1" if (h & 0x200) == 0 else "2"
+        base = sa if (h & 0x200) == 0 else sb
         return _facade_parapet(mx, my, base, rg, ix, iy)
 
-    alley_v = (h >> 16) & 3 == 0
-    alley_h = (h2 >> 16) & 3 == 0
+    alley_v, alley_h = districts.alley_flags_for_district(dist, h, h2)
     vx = 2 if (h & 1) == 0 else rg - 2
     vy = 2 if (h2 & 1) == 0 else rg - 2
     if alley_v and ix == vx:
-        return _apply_env_props(mx, my, "0", rg, ix, iy)
+        return _apply_env_props(mx, my, "0", rg, ix, iy, dist)
     if alley_h and iy == vy:
-        return _apply_env_props(mx, my, "0", rg, ix, iy)
+        return _apply_env_props(mx, my, "0", rg, ix, iy, dist)
 
-    mid = rg // 2
-    if ix == mid and iy == mid:
-        return _apply_env_props(mx, my, "b", rg, ix, iy)
+    lm = districts.try_landmark_cell(ix, iy, bx, by, rg, seed, alley_v, alley_h, vx, vy)
+    if lm is not None:
+        return lm
 
     corners = ((2, 2), (2, rg - 2), (rg - 2, 2), (rg - 2, rg - 2))
     if (ix, iy) in corners and ((h >> 8) & 3) < 2:
         return "3"
 
-    base = "1" if (h & 0x100) == 0 else "2"
+    if districts.is_plaza_center_cell(ix, iy, rg, dist):
+        return _apply_env_props(mx, my, "P", rg, ix, iy, dist)
+
+    mid = rg // 2
+    if ix == mid and iy == mid:
+        return _apply_env_props(mx, my, "b", rg, ix, iy, dist)
+
+    base = sa if (h & 0x100) == 0 else sb
     return _facade_parapet(mx, my, base, rg, ix, iy)
 
 
@@ -283,37 +319,184 @@ def placement_cell_in_front_of_hit(mx, my, side, yaw):
     return mx, my - step_y
 
 
-def try_place_wall_block(px, py, yaw, tile_size, enemy_list, max_dist_world):
-    if R.inventory_blocks <= 0:
+# Street props — not removed with the demolition tool (use cover, not delete).
+_NON_DEMOLISH_PROPS = frozenset({"4", "5", "6", "7", "8", "u"})
+
+
+def is_demolishable_wall_char(ch: str) -> bool:
+    """True for structural / wall cells that the demo tool can carve open."""
+    if is_walkable_cell(ch) or ch in _NON_DEMOLISH_PROPS:
         return False
-    d, mx, my, side, _hx, _hy, _wc = cast_ray(px, py, yaw, tile_size)
+    return True
+
+
+def evaluate_block_placement(px, py, yaw, tile_size, enemy_list, max_dist_world):
+    """
+    Shared rules for placement preview and try_place_wall_block.
+    Returns (ok, reason, cx, cy, hit_dist, hit_wall_char).
+    reason is one of: ok, no_hit, too_far, too_close, chunk_hit, chunk_place, not_walkable,
+    player_cell, enemy_cell.
+    """
+    d, mx, my, side, _hx, _hy, wc = cast_ray(px, py, yaw, tile_size)
     if math.isinf(d) or mx < 0:
-        return False
-    if d > max_dist_world or d < tile_size * 0.2:
-        return False
+        return False, "no_hit", None, None, d, wc
+    if d > max_dist_world:
+        return False, "too_far", None, None, d, wc
+    if d < tile_size * 0.2:
+        return False, "too_close", None, None, d, wc
     if not chunk_is_active(mx, my):
-        return False
+        return False, "chunk_hit", None, None, d, wc
 
     cx, cy = placement_cell_in_front_of_hit(mx, my, side, yaw)
+    if cx is None or cy is None:
+        return False, "no_hit", None, None, d, wc
     if not chunk_is_active(cx, cy):
-        return False
+        return False, "chunk_place", cx, cy, d, wc
     if not is_walkable_cell(sample_world_cell(cx, cy)):
-        return False
+        return False, "not_walkable", cx, cy, d, wc
 
     pmx = int(math.floor(px / tile_size))
     pmy = int(math.floor(py / tile_size))
     if (cx, cy) == (pmx, pmy):
-        return False
+        return False, "player_cell", cx, cy, d, wc
 
     for e in enemy_list:
         emx = int(math.floor(e.x / tile_size))
         emy = int(math.floor(e.y / tile_size))
         if (emx, emy) == (cx, cy):
-            return False
+            return False, "enemy_cell", cx, cy, d, wc
 
-    R.world_cell_edits[(cx, cy)] = "1"
+    return True, "ok", cx, cy, d, wc
+
+
+def get_placement_preview(px, py, yaw, tile_size, enemy_list, max_dist_world, inventory_blocks):
+    """
+    HUD / overlay: where a block would go and whether placement is valid.
+    `layout_ok` True if the cell is a legal placement; `affordable` if inventory allows spending one.
+    """
+    ok, reason, cx, cy, hit_d, wc = evaluate_block_placement(px, py, yaw, tile_size, enemy_list, max_dist_world)
+    if not ok or cx is None:
+        return {
+            "layout_ok": False,
+            "affordable": False,
+            "reason": reason,
+            "cx": cx,
+            "cy": cy,
+            "hit_dist": hit_d,
+            "hit_wall": wc,
+        }
+    return {
+        "layout_ok": True,
+        "affordable": inventory_blocks > 0,
+        "reason": "ok",
+        "cx": cx,
+        "cy": cy,
+        "hit_dist": hit_d,
+        "hit_wall": wc,
+    }
+
+
+def try_place_wall_block(px, py, yaw, tile_size, enemy_list, max_dist_world):
+    if R.inventory_blocks <= 0:
+        return False
+    ok, reason, cx, cy, _, _ = evaluate_block_placement(px, py, yaw, tile_size, enemy_list, max_dist_world)
+    if not ok or reason != "ok":
+        return False
+    R.world_cell_edits[(cx, cy)] = getattr(R, "player_placed_wall_char", "1")
     R.inventory_blocks -= 1
     return True
+
+
+def evaluate_demolish_target(px, py, yaw, tile_size, max_dist_world):
+    """
+    Ray hits the wall face you are looking at; we remove that solid cell (edit to open air).
+    Returns (ok, reason, mx, my, hit_dist, wall_char).
+    """
+    d, mx, my, side, _hx, _hy, wc = cast_ray(px, py, yaw, tile_size)
+    if math.isinf(d) or mx < 0:
+        return False, "no_hit", None, None, d, wc
+    if d > max_dist_world:
+        return False, "too_far", None, None, d, wc
+    if not chunk_is_active(mx, my):
+        return False, "chunk", None, None, d, wc
+    if is_walkable_cell(wc):
+        return False, "not_wall", None, None, d, wc
+    if not is_demolishable_wall_char(wc):
+        return False, "not_demolishable", mx, my, d, wc
+
+    pmx = int(math.floor(px / tile_size))
+    pmy = int(math.floor(py / tile_size))
+    if (mx, my) == (pmx, pmy):
+        return False, "player_cell", mx, my, d, wc
+
+    return True, "ok", mx, my, d, wc
+
+
+def try_demolish_wall_block(px, py, yaw, tile_size, max_dist_world):
+    ok, reason, mx, my, _, _ = evaluate_demolish_target(px, py, yaw, tile_size, max_dist_world)
+    if not ok or mx is None or reason != "ok":
+        return False
+    R.world_cell_edits[(mx, my)] = "0"
+    return True
+
+
+def project_world_point_to_screen(
+    px,
+    py,
+    wx,
+    wy,
+    yaw,
+    ray_hits,
+    screen_w,
+    screen_h,
+    fov,
+    pitch_offset_px,
+    horizon_skew_px,
+):
+    """
+    Project a world (x,y) point to screen (same math as bullet tracers).
+    Returns (screen_x, horizon_y_at_column, perp_depth) or None if off-screen / behind.
+    """
+    proj_plane = (screen_w / 2) / math.tan(fov / 2)
+    half_fov = fov / 2
+    n = len(ray_hits)
+    if n == 0:
+        return None
+
+    def depth_at_column(x):
+        if x < 0:
+            x = 0
+        if x >= screen_w:
+            x = screen_w - 1
+        ci = int(x / screen_w * n)
+        if ci >= n:
+            ci = n - 1
+        d = ray_hits[ci][0]
+        return float("inf") if math.isinf(d) else float(d)
+
+    cos_y = math.cos(yaw)
+    sin_y = math.sin(yaw)
+    along_view = (wx - px) * cos_y + (wy - py) * sin_y
+    if along_view <= 0:
+        return None
+    ang = math.atan2(wy - py, wx - px)
+    rel = ang - yaw
+    while rel > math.pi:
+        rel -= 2 * math.pi
+    while rel < -math.pi:
+        rel += 2 * math.pi
+    if abs(rel) > half_fov * 1.02:
+        return None
+    sx = int(screen_w / 2 + math.tan(rel) * proj_plane)
+    if sx < 0 or sx >= screen_w:
+        return None
+    ri = screen_column_to_ray_index(sx, screen_w, n)
+    r_ang = ray_angle_for_index(ri, n, yaw, fov)
+    d_pt = perpendicular_depth_along_ray(px, py, wx, wy, r_ang)
+    if d_pt <= 0 or d_pt >= depth_at_column(sx):
+        return None
+    hy = horizon_y_at_screen_x(sx, screen_w, n, screen_h, pitch_offset_px, horizon_skew_px)
+    return sx, hy, d_pt
 
 
 def world_pos_to_grid(wx, wy, tile_size):
@@ -335,14 +518,39 @@ def compute_ray_hits(px, py, yaw, tile_size, fov, num_rays):
     return out
 
 
+def ray_angle_for_index(i: int, num_rays: int, view_yaw: float, fov: float) -> float:
+    """Ray direction for column i — must match compute_ray_hits (used for sprite vs wall depth)."""
+    half = fov / 2
+    if num_rays <= 1:
+        return view_yaw
+    t = i / (num_rays - 1)
+    return view_yaw - half + t * fov
+
+
+def screen_column_to_ray_index(col: int, screen_w: int, num_rays: int) -> int:
+    """Map screen x to ray index (same as horizon / depth sampling)."""
+    if num_rays <= 0:
+        return 0
+    i = int(col / screen_w * num_rays)
+    return max(0, min(num_rays - 1, i))
+
+
+def perpendicular_depth_along_ray(px: float, py: float, wx: float, wy: float, ray_angle: float) -> float:
+    """
+    Distance along the cast ray to the perpendicular plane through (wx, wy).
+    Comparable to wall distances from cast_ray for occlusion tests.
+    """
+    return (wx - px) * math.cos(ray_angle) + (wy - py) * math.sin(ray_angle)
+
+
 def can_walk_world(wx, wy, tile_size):
     mx = int(math.floor(wx / tile_size))
     my = int(math.floor(wy / tile_size))
     return is_walkable_cell(lod_world_cell(mx, my))
 
 
-def apply_slide_move(px, py, dx, dy, tile_size):
-    """Try full move, then axis slides (same idea as enemy movement)."""
+def _slide_step(px, py, dx, dy, tile_size):
+    """One slide attempt: diagonal, then X, then Y."""
     nx, ny = px + dx, py + dy
     if can_walk_world(nx, ny, tile_size):
         return nx, ny
@@ -353,9 +561,39 @@ def apply_slide_move(px, py, dx, dy, tile_size):
     return px, py
 
 
+def apply_slide_move(px, py, dx, dy, tile_size):
+    """
+    Slide along walls with sub-steps to reduce corner snagging and jitter.
+    See settings.MOVE_COLLISION_SUBSTEPS.
+    """
+    n = max(1, int(cfg.MOVE_COLLISION_SUBSTEPS))
+    if n <= 1:
+        return _slide_step(px, py, dx, dy, tile_size)
+    sx, sy = dx / n, dy / n
+    for _ in range(n):
+        px, py = _slide_step(px, py, sx, sy, tile_size)
+    return px, py
+
+
 def _wall_base_rgb(wall_char):
     if wall_char == "2":
         return (148, 136, 124)
+    if wall_char == "D":
+        return (108, 124, 148)
+    if wall_char == "L":
+        return (158, 138, 118)
+    if wall_char == "W":
+        return (92, 96, 102)
+    if wall_char == "M":
+        return (112, 88, 68)
+    if wall_char == "T":
+        return (118, 120, 126)
+    if wall_char == "K":
+        return (168, 158, 128)
+    if wall_char == "E":
+        return (86, 90, 76)
+    if wall_char == "S":
+        return (132, 134, 140)
     if wall_char == "3":
         return (72, 78, 88)
     if wall_char == "4":
@@ -370,6 +608,8 @@ def _wall_base_rgb(wall_char):
         return (52, 74, 56)
     if wall_char == "9":
         return (118, 120, 128)
+    if wall_char == "u":
+        return (98, 102, 95)
     return cfg.WALL_COLOR_BASE
 
 
@@ -387,9 +627,16 @@ def wall_color(mx, my, side, hit_x, hit_y, tile_size, distance_shade, wall_char=
         u = (hit_x % tile_size) / tile_size
     band = 0.82 + 0.18 * (1 if int(u * 3) % 2 == 0 else 0)
     # Voxel-style horizontal “floors” + window strip on buildings.
-    if wall_char in ("1", "2"):
+    if wall_char in ("1", "2", "D", "L", "W", "M"):
         win = 0.92 + 0.08 * (1 if int(u * 5) % 2 == 0 else 0)
         band *= win
+        if wall_char == "D":
+            band *= 0.94 + 0.12 * (1 if int(u * 7) % 2 == 0 else 0)
+        elif wall_char == "L":
+            band *= 0.96 + 0.08 * (1 if int(u * 4) % 2 == 0 else 0)
+        elif wall_char in ("W", "M"):
+            corrug = int(u * 11) % 2
+            band *= 0.9 + 0.1 * corrug
     elif wall_char == "3":
         band *= 0.94 + 0.06 * (1 if int(u * 4) % 2 == 0 else 0)
     elif wall_char == "4":
@@ -442,18 +689,72 @@ def wall_color(mx, my, side, hit_x, hit_y, tile_size, distance_shade, wall_char=
         elif u > 0.78:
             band *= 0.88
         band *= 0.94 + 0.06 * (1 if int(u * 4) % 2 == 0 else 0)
+    elif wall_char == "u":
+        # Utility / electrical box: vent grille + hazard band
+        grille = int(u * 12) % 2
+        band *= 0.88 + 0.14 * grille
+        if 0.25 < u < 0.38:
+            br = min(255, br + 40)
+            bg = min(255, bg + 28)
+    elif wall_char == "T":
+        # Water tower: legs + tank
+        if u < 0.35:
+            band *= 0.88
+        elif u > 0.62:
+            band *= 1.22
+            br = min(255, br + 25)
+            bg = min(255, bg + 24)
+            bb = min(255, bb + 26)
+        stripe = int(u * 14) % 2
+        band *= 0.92 + 0.1 * stripe
+    elif wall_char == "K":
+        # Checkpoint gate: hazard stripes
+        stripe = (int(u * 10) + int(mx * 2 + my * 3)) % 2
+        band *= 0.88 + 0.16 * stripe
+        if stripe:
+            br = min(255, br + 35)
+            bg = min(255, bg + 28)
+    elif wall_char == "E":
+        # Chain-link fence
+        mesh = (int(u * 12) + int(mx + my)) % 2
+        band *= 0.9 + 0.08 * mesh
+        br = min(255, br + mesh * 8)
+    elif wall_char == "S":
+        # Plaza statue / fountain plinth
+        if u < 0.25:
+            band *= 1.15
+        elif u > 0.72:
+            band *= 1.08
+        band *= 0.94 + 0.06 * (1 if int(u * 5) % 2 == 0 else 0)
     r = max(0, min(255, int(br * band * distance_shade)))
     g = max(0, min(255, int(bg * band * distance_shade)))
     b = max(0, min(255, int(bb * band * distance_shade)))
     return r, g, b
 
 
-def floor_color_for_cell(ch):
+def floor_color_for_cell(ch, fmx=None, fmy=None):
     if ch == "a":
-        return cfg.FLOOR_COLOR_SIDEWALK
-    if ch == "b":
-        return cfg.FLOOR_COLOR_LOT
-    return cfg.FLOOR_COLOR_ROAD
+        base = cfg.FLOOR_COLOR_SIDEWALK
+    elif ch == "b":
+        base = cfg.FLOOR_COLOR_LOT
+    elif ch == "P":
+        base = cfg.FLOOR_COLOR_PLAZA
+    elif ch == "f":
+        base = cfg.FLOOR_COLOR_YARD
+    else:
+        base = cfg.FLOOR_COLOR_ROAD
+    if fmx is None or fmy is None:
+        return base
+    rg = cfg.URBAN_ROAD_SPACING
+    bx, by = fmx // rg, fmy // rg
+    dist = districts.district_type_at_block(bx, by, int(R.world_gen_seed))
+    mr, mg, mb = districts.floor_rgb_multipliers(dist)
+    br, bg, bb = base
+    return (
+        max(0, min(255, int(br * mr))),
+        max(0, min(255, int(bg * mg))),
+        max(0, min(255, int(bb * mb))),
+    )
 
 
 def _wall_texture_u(hit_x, hit_y, tile_size, side):
@@ -520,7 +821,7 @@ def draw_raycast_view(
         fmx = int(math.floor(fx / tile_size))
         fmy = int(math.floor(fy / tile_size))
         fch = sample_world_cell(fmx, fmy)
-        fr, fg, fb = floor_color_for_cell(fch)
+        fr, fg, fb = floor_color_for_cell(fch, fmx, fmy)
         tdist = min(1.0, (2.1 * tile_size) / cfg.MAX_SHADE_DISTANCE)
         fshade = max(0.55, 1.0 - 0.38 * tdist)
         floor_rgb = (
@@ -597,7 +898,7 @@ def draw_raycast_view(
 
         if (
             tex is None
-            and wall_char in ("1", "2", "3", "9")
+            and wall_char in ("1", "2", "3", "9", "D", "L", "W", "M")
             and cfg.WALL_BANDS > 1
             and line_h > cfg.WALL_BANDS * 3
         ):

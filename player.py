@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import pygame
 
 import assets
+import progression
 import runtime as R
 import settings as cfg
 import world
@@ -28,31 +29,130 @@ class Weapon:
     bullet_speed: float
     magazine_size: int
     reload_time: float
+    # Volley / feel (single-shot: pellet_count=1, spread_rad=0).
+    pellet_count: int = 1
+    spread_rad: float = 0.0
+    pellet_damage: float | None = None  # None → use `damage` for each pellet
+    muzzle_flash_scale: float = 1.0
+    muzzle_flash_duration: float = 0.11
+    screen_shake_mul: float = 1.0
+    particle_burst_mul: float = 1.0
+    tracer_style: int = 0  # 0 pistol 1 rifle 2 shotgun (tracer colors)
 
 
 WEAPONS = (
-    Weapon(1, "Pistol", 0.17, 0.017, 10.0, 24.0, False, 820.0, 12, 0.95),
-    Weapon(2, "Rifle", 0.36, 0.038, 22.0, 100.0, True, 880.0, 30, 1.55),
+    Weapon(
+        1,
+        "Pistol",
+        0.16,
+        0.02,
+        11.0,
+        24.0,
+        False,
+        840.0,
+        12,
+        0.92,
+        pellet_count=1,
+        spread_rad=0.0,
+        muzzle_flash_scale=0.92,
+        muzzle_flash_duration=0.078,
+        screen_shake_mul=0.78,
+        particle_burst_mul=0.82,
+        tracer_style=0,
+    ),
+    Weapon(
+        2,
+        "Rifle",
+        0.34,
+        0.045,
+        26.0,
+        28.0,
+        False,
+        920.0,
+        30,
+        1.48,
+        pellet_count=1,
+        spread_rad=0.0,
+        muzzle_flash_scale=1.12,
+        muzzle_flash_duration=0.125,
+        screen_shake_mul=1.32,
+        particle_burst_mul=1.18,
+        tracer_style=1,
+    ),
+    Weapon(
+        3,
+        "Shotgun",
+        0.86,
+        0.055,
+        34.0,
+        12.0,
+        False,
+        720.0,
+        6,
+        2.35,
+        pellet_count=7,
+        spread_rad=0.15,
+        pellet_damage=11.0,
+        muzzle_flash_scale=1.55,
+        muzzle_flash_duration=0.15,
+        screen_shake_mul=1.62,
+        particle_burst_mul=1.45,
+        tracer_style=2,
+    ),
 )
 
 weapon_ammo = [w.magazine_size for w in WEAPONS]
 reload_timers = [0.0] * len(WEAPONS)
 
-# [x, y, angle, dist, damage, destroys_wall, speed, prev_x, prev_y]
+# [x, y, angle, dist, damage, destroys_wall, speed, prev_x, prev_y, tracer_style]
 player_bullets = []
 
 
-def spawn_bullet(bullets, px, py, angle, wpn):
+def sync_weapon_ammo_for_unlocks():
+    """Zero ammo for locked weapons; full mags for unlocked (call after load / new run)."""
+    progression.ensure_loaded()
+    for i, w in enumerate(WEAPONS):
+        if progression.is_weapon_slot_unlocked(w.slot):
+            weapon_ammo[i] = w.magazine_size
+        else:
+            weapon_ammo[i] = 0
+    for i in range(len(reload_timers)):
+        reload_timers[i] = 0.0
+
+_TRACER_BY_STYLE = (
+    ((255, 220, 140), (255, 255, 245)),  # pistol — warm
+    ((255, 190, 90), (255, 255, 255)),  # rifle — crisp
+    ((255, 160, 70), (255, 240, 200)),  # shotgun — orange bloom
+)
+
+
+def _append_bullet(bullets, bx, by, ang, dmg, dest_wall, bspd, tracer_style):
     if len(bullets) >= cfg.BULLET_MAX_ALIVE:
         return
-    c = math.cos(angle)
-    s = math.sin(angle)
+    bullets.append([bx, by, ang, 0.0, dmg, dest_wall, bspd, bx, by, tracer_style])
+
+
+def spawn_weapon_volley(bullets, px, py, base_angle, wpn):
+    """Fire one trigger pull: one or many pellets with spread."""
+    c = math.cos(base_angle)
+    s = math.sin(base_angle)
     o = cfg.BULLET_SPAWN_OFFSET
-    bx = px + c * o
-    by = py + s * o
-    bullets.append(
-        [bx, by, angle, 0.0, wpn.damage, 1 if wpn.destroys_wall else 0, wpn.bullet_speed, bx, by]
-    )
+    pdmg = wpn.pellet_damage if wpn.pellet_damage is not None else wpn.damage
+    n = max(1, wpn.pellet_count)
+    dw = 1 if wpn.destroys_wall else 0
+    for i in range(n):
+        if n == 1:
+            off = 0.0
+        else:
+            u = -1.0 + 2.0 * i / max(n - 1, 1)
+            jitter = wpn.spread_rad * 0.14
+            off = u * wpn.spread_rad * 0.52 + random.uniform(-jitter, jitter)
+        ang = base_angle + off
+        cc = math.cos(ang)
+        ss = math.sin(ang)
+        bx = px + cc * o
+        by = py + ss * o
+        _append_bullet(bullets, bx, by, ang, pdmg, dw, wpn.bullet_speed, wpn.tracer_style)
 
 
 def update_bullets(bullets, dt, tile_size, enemies):
@@ -61,8 +161,11 @@ def update_bullets(bullets, dt, tile_size, enemies):
     i = 0
     while i < len(bullets):
         b = bullets[i]
-        while len(b) < 9:
-            b.append(b[0])
+        if len(b) < 9:
+            bullets.pop(i)
+            continue
+        if len(b) == 9:
+            b.append(0)
         bx, by, ang, dist_acc, dmg, dest_wall, bspd = (
             b[0],
             b[1],
@@ -106,6 +209,7 @@ def update_bullets(bullets, dt, tile_size, enemies):
                     R.enemies_defeated += 1
                     R.kills_this_wave += 1
                     kills += 1
+                    progression.register_kill(1)
                 hits += 1
                 hit_enemy = True
                 break
@@ -141,8 +245,8 @@ def _project_bullet_to_screen(
     cos_y = math.cos(yaw)
     sin_y = math.sin(yaw)
     dist = math.hypot(bx - px, by - py)
-    along_t = (bx - px) * cos_y + (by - py) * sin_y
-    if along_t <= 0:
+    along_view = (bx - px) * cos_y + (by - py) * sin_y
+    if along_view <= 0:
         return None
     ang = math.atan2(by - py, bx - px)
     rel = ang - yaw
@@ -155,7 +259,10 @@ def _project_bullet_to_screen(
     sx = int(screen_w / 2 + math.tan(rel) * proj_plane)
     if sx < 0 or sx >= screen_w:
         return None
-    if along_t >= depth_at_column(sx):
+    ri = world.screen_column_to_ray_index(sx, screen_w, n)
+    r_ang = world.ray_angle_for_index(ri, n, yaw, fov)
+    d_bullet = world.perpendicular_depth_along_ray(px, py, bx, by, r_ang)
+    if d_bullet <= 0 or d_bullet >= depth_at_column(sx):
         return None
     hy = world.horizon_y_at_screen_x(sx, screen_w, n, screen_h, pitch_offset_px, horizon_skew_px)
     return sx, hy, dist
@@ -171,14 +278,16 @@ def draw_bullet_tracers(
         return
 
     ordered = sorted(bullets, key=lambda bb: -(math.hypot(bb[0] - px, bb[1] - py)))
-    col = (255, 255, 230)
-    glow = (255, 200, 90)
-    core = (255, 255, 255)
 
     for b in ordered:
         bx, by = b[0], b[1]
         prx = b[7] if len(b) > 8 else bx
         pry = b[8] if len(b) > 8 else by
+        st = b[9] if len(b) > 9 else 0
+        if st < 0 or st >= len(_TRACER_BY_STYLE):
+            st = 0
+        glow, core = _TRACER_BY_STYLE[st]
+        col = core
         cur = _project_bullet_to_screen(
             bx, by, px, py, yaw, ray_hits, screen_w, screen_h, fov, pitch_offset_px, horizon_skew_px
         )
@@ -192,15 +301,16 @@ def draw_bullet_tracers(
             psx, phy, _ = prev
             pygame.draw.line(surface, glow, (psx, phy), (sx, hy), 2)
             pygame.draw.line(surface, col, (psx, phy), (sx, hy), 1)
-        r = max(2, min(7, int(360 / max(dist, 8.0))))
+        r = max(2, min(8, int(380 / max(dist, 8.0))))
         pygame.draw.circle(surface, glow, (sx, hy), r + 2)
         pygame.draw.circle(surface, col, (sx, hy), r)
-        pygame.draw.circle(surface, core, (sx, hy), max(1, r // 2))
+        pygame.draw.circle(surface, (255, 255, 255), (sx, hy), max(1, r // 2))
 
 
-def spawn_muzzle_particles(particles, cx, cy):
+def spawn_muzzle_particles(particles, cx, cy, burst_mul=1.0):
     room = cfg.PARTICLE_MAX_ALIVE - len(particles)
-    n = min(cfg.PARTICLE_BURST_COUNT, max(0, room))
+    base = int(round(cfg.PARTICLE_BURST_COUNT * burst_mul))
+    n = min(max(4, base), max(0, room))
     for _ in range(n):
         a = random.uniform(0, 2 * math.pi)
         sp = random.uniform(cfg.PARTICLE_SPEED_MIN, cfg.PARTICLE_SPEED_MAX)
@@ -222,20 +332,25 @@ def update_shot_particles(particles, dt):
             i += 1
 
 
-def draw_muzzle_flash(surface, cx, cy, timer, duration):
+def draw_muzzle_flash(surface, cx, cy, timer, duration, scale=1.0, warm_tint=False):
     if timer <= 0:
         return
     t = timer / duration if duration > 0 else 0
-    rad = max(8, int(cfg.MUZZLE_FLASH_RADIUS * (0.4 + 0.6 * t)))
-    col = (255, min(255, 180 + int(75 * t)), 90)
+    rad = max(8, int(cfg.MUZZLE_FLASH_RADIUS * scale * (0.45 + 0.55 * t)))
+    if warm_tint:
+        col = (255, min(255, 150 + int(90 * t)), min(255, 70 + int(80 * t)))
+        halo = (255, 200, 120)
+    else:
+        col = (255, min(255, 180 + int(75 * t)), 90)
+        halo = (255, 240, 200)
     ix, iy = int(cx), int(cy)
-    pygame.draw.circle(surface, (255, 240, 200), (ix, iy), rad + 4, 2)
+    pygame.draw.circle(surface, halo, (ix, iy), rad + 5, 3)
     pygame.draw.circle(surface, col, (ix, iy), rad)
-    for i in range(4):
-        ang = i * (math.pi / 2) + t * 0.4
-        dx = math.cos(ang) * (rad + 6)
-        dy = math.sin(ang) * (rad + 6)
-        pygame.draw.line(surface, (255, 220, 160), (ix, iy), (int(ix + dx), int(iy + dy)), 2)
+    for i in range(6):
+        ang = i * (math.pi / 3) + t * 0.5
+        dx = math.cos(ang) * (rad + 8)
+        dy = math.sin(ang) * (rad + 8)
+        pygame.draw.line(surface, (255, 230, 170), (ix, iy), (int(ix + dx), int(iy + dy)), 2)
     pygame.draw.circle(surface, (255, 255, 255), (ix, iy), max(2, rad // 3))
 
 

@@ -1,5 +1,5 @@
 """
-Rule-based enemy AI: idle, patrol, chase, attack.
+Rule-based enemy AI: idle, patrol, chase, attack, search.
 
 State numbers match settings.ENEMY_ST_*. Per-type tuning lives in enemy_types.EnemyTypeSpec.
 """
@@ -12,6 +12,21 @@ from typing import Tuple
 
 import settings as cfg
 import world
+
+
+def _has_los_to_player(ex: float, ey: float, px: float, py: float, tile_size: float) -> bool:
+    """Ray from enemy to player clears walls (same idea as enemy.clear_shot_to_player)."""
+    dx = px - ex
+    dy = py - ey
+    dist_p = math.hypot(dx, dy)
+    if dist_p < 1e-6:
+        return True
+    ang = math.atan2(dy, dx)
+    d_wall, _mx, _my, _side, hx, hy, _wc = world.cast_ray(ex, ey, ang, tile_size)
+    if math.isinf(d_wall):
+        return True
+    dist_w = math.hypot(hx - ex, hy - ey)
+    return dist_w >= dist_p - cfg.ENEMY_SHOOT_LOS_EPS
 
 
 def _ranges(sp):
@@ -28,34 +43,74 @@ def _calm_state(sp):
     return cfg.ENEMY_ST_PATROL if sp.prefers_patrol_when_calm else cfg.ENEMY_ST_IDLE
 
 
-def _update_aggro_state(e, sp, dist: float) -> None:
+def _awareness_ok(dist: float, has_los: bool) -> bool:
+    """Player counts as “noticed” for committing to CHASE (sight or very close)."""
+    return has_los or dist <= cfg.ENEMY_HEAR_RANGE
+
+
+def _update_aggro_state(e, sp, dist: float, has_los: bool, px: float, py: float, dt: float) -> None:
     """
-    Hysteresis: acquire when inside detect, drop when beyond lost; between the two, keep fight if already engaged.
+    Hysteresis + LOS: lose sight while still inside lost-range → SEARCH at last known point.
+    Calm → CHASE only after a short alert delay (staggered spawns).
     """
     d_det, d_lost, a_in, a_out = _ranges(sp)
     st = e.ai_state
 
     if dist > d_lost:
         e.ai_state = _calm_state(sp)
+        e.search_timer = 0.0
+        e.acquire_delay = e.acquire_delay_reset
         return
 
-    if dist <= d_det:
-        if st in (cfg.ENEMY_ST_IDLE, cfg.ENEMY_ST_PATROL):
+    if has_los and st in (cfg.ENEMY_ST_CHASE, cfg.ENEMY_ST_ATTACK, cfg.ENEMY_ST_SEARCH):
+        e.last_seen_px, e.last_seen_py = px, py
+
+    # --- SEARCH ---
+    if st == cfg.ENEMY_ST_SEARCH:
+        e.search_timer -= dt
+        if has_los:
             e.ai_state = cfg.ENEMY_ST_CHASE
-        # Hysteresis: enter ATTACK when close enough; leave only past a_out (same idea as settings attack bands).
-        if e.ai_state == cfg.ENEMY_ST_CHASE and dist <= a_in:
-            e.ai_state = cfg.ENEMY_ST_ATTACK
-        elif e.ai_state == cfg.ENEMY_ST_ATTACK and dist > a_out:
-            e.ai_state = cfg.ENEMY_ST_CHASE
+        elif e.search_timer <= 0.0:
+            e.ai_state = _calm_state(sp)
+            e.patrol_ox = e.last_seen_px
+            e.patrol_oy = e.last_seen_py
+            e.acquire_delay = e.acquire_delay_reset
         return
 
-    # d_det < dist <= d_lost — still “on” you until you break line / distance
-    if st in (cfg.ENEMY_ST_CHASE, cfg.ENEMY_ST_ATTACK):
-        if e.ai_state == cfg.ENEMY_ST_ATTACK and dist > a_out:
+    in_detect = dist <= d_det and _awareness_ok(dist, has_los)
+
+    # Broke LOS while still engaged → investigate (not if we’re already in knife-fight range).
+    if st in (cfg.ENEMY_ST_CHASE, cfg.ENEMY_ST_ATTACK) and not has_los:
+        if dist > cfg.ENEMY_HEAR_RANGE * 1.05:
+            e.ai_state = cfg.ENEMY_ST_SEARCH
+            e.search_timer = cfg.ENEMY_SEARCH_DURATION * sp.search_duration_mult
+            return
+
+    if not in_detect:
+        if st in (cfg.ENEMY_ST_CHASE, cfg.ENEMY_ST_ATTACK):
+            if not has_los:
+                e.ai_state = cfg.ENEMY_ST_SEARCH
+                e.search_timer = cfg.ENEMY_SEARCH_DURATION * sp.search_duration_mult
+                return
+            # Still have LOS past the inner detect ring — keep pushing (memory is outer lost range).
+        else:
+            e.ai_state = _calm_state(sp)
+            e.acquire_delay = e.acquire_delay_reset
+            return
+
+    # in_detect — calm states commit after alert delay
+    if st in (cfg.ENEMY_ST_IDLE, cfg.ENEMY_ST_PATROL):
+        e.acquire_delay -= dt
+        if e.acquire_delay <= 0.0:
             e.ai_state = cfg.ENEMY_ST_CHASE
+            e.last_seen_px, e.last_seen_py = px, py
         return
 
-    e.ai_state = _calm_state(sp)
+    # CHASE / ATTACK band hysteresis
+    if st == cfg.ENEMY_ST_CHASE and dist <= a_in:
+        e.ai_state = cfg.ENEMY_ST_ATTACK
+    elif st == cfg.ENEMY_ST_ATTACK and dist > a_out:
+        e.ai_state = cfg.ENEMY_ST_CHASE
 
 
 def _separation(e_idx: int, enemies, radius: float) -> Tuple[float, float]:
@@ -103,11 +158,12 @@ def _patrol_heading(e, sp, dt: float) -> Tuple[float, float]:
 
 
 def _attack_move(e, sp, dx: float, dy: float, dist: float, dt: float) -> Tuple[float, float]:
-    """Standoff + simple strafe while shooting."""
+    """Standoff + strafe; speed varies by type."""
     shoot_r = cfg.ENEMY_SHOOT_RANGE
     lo = shoot_r * sp.attack_standoff_min_frac
     hi = shoot_r * sp.attack_standoff_max_frac
-    e.strafe_phase += dt * (2.1 + 0.12 * math.sin(e.patrol_ox * 0.02 + e.patrol_oy * 0.02))
+    sm = sp.attack_strafe_mult
+    e.strafe_phase += dt * (2.1 + 0.12 * math.sin(e.patrol_ox * 0.02 + e.patrol_oy * 0.02)) * sm
     if dist < 1e-5:
         return 0.0, 0.0
     ux, uy = dx / dist, dy / dist
@@ -118,6 +174,39 @@ def _attack_move(e, sp, dx: float, dy: float, dist: float, dt: float) -> Tuple[f
         return ux, uy
     w = math.sin(e.strafe_phase)
     return px * w, py * w
+
+
+def _chase_heading(e, sp, dx: float, dy: float, dist: float) -> Tuple[float, float]:
+    """Move toward player with optional flank offset (scouts circle, heavies march in)."""
+    if dist < 1e-5:
+        return 0.0, 0.0
+    ux, uy = dx / dist, dy / dist
+    px, py = -uy, ux
+    f = sp.chase_flank_bias
+    if f < 1e-6:
+        return ux, uy
+    side = math.sin(e.strafe_phase * 0.85 + e.patrol_ox * 0.01)
+    fx = ux + px * f * side
+    fy = uy + py * f * side
+    m = math.hypot(fx, fy)
+    if m < 1e-6:
+        return ux, uy
+    return fx / m, fy / m
+
+
+def _search_heading(e, sp, dt: float) -> Tuple[float, float]:
+    """Go to last seen; small wander when close."""
+    dx = e.last_seen_px - e.x
+    dy = e.last_seen_py - e.y
+    d = math.hypot(dx, dy)
+    if d < 36.0:
+        jitter = cfg.ENEMY_WANDER_TURN_MAX * (0.55 + 0.35 * sp.patrol_wander_mult)
+        e.wander_heading += random.uniform(-jitter, jitter) * dt
+        c = math.cos(e.wander_heading)
+        s = math.sin(e.wander_heading)
+        return c, s
+    inv = 1.0 / d
+    return dx * inv, dy * inv
 
 
 def _try_slide(ex, ey, mx, my, step, tile_size):
@@ -145,7 +234,8 @@ def tick(enemies, px: float, py: float, dt: float, tile_size: float) -> None:
             continue
         dist = math.sqrt(dist_sq)
 
-        _update_aggro_state(e, sp, dist)
+        has_los = _has_los_to_player(e.x, e.y, px, py, tile_size)
+        _update_aggro_state(e, sp, dist, has_los, px, py, dt)
 
         sx, sy = _separation(i, enemies, sp.separation_radius)
         sep_w = sp.separation_weight * cfg.ENEMY_SEPARATION_BLEND
@@ -158,10 +248,13 @@ def tick(enemies, px: float, py: float, dt: float, tile_size: float) -> None:
         elif st == cfg.ENEMY_ST_PATROL:
             mx, my = _patrol_heading(e, sp, dt)
         elif st == cfg.ENEMY_ST_CHASE:
+            e.strafe_phase += dt * (1.2 + 0.35 * sp.chase_flank_bias)
             if dist >= cfg.ENEMY_MIN_MOVE_DIST:
-                mx, my = dx / dist, dy / dist
+                mx, my = _chase_heading(e, sp, dx, dy, dist)
         elif st == cfg.ENEMY_ST_ATTACK:
             mx, my = _attack_move(e, sp, dx, dy, dist, dt)
+        elif st == cfg.ENEMY_ST_SEARCH:
+            mx, my = _search_heading(e, sp, dt)
 
         mx, my = _blend_dir(mx, my, sx, sy, sep_w)
 
@@ -170,10 +263,10 @@ def tick(enemies, px: float, py: float, dt: float, tile_size: float) -> None:
             if mx == 0.0 and my == 0.0:
                 continue
 
-        # Too close to player to advance further — still allow separation / attack strafe
         if dist < cfg.ENEMY_MIN_MOVE_DIST and st not in (
             cfg.ENEMY_ST_ATTACK,
             cfg.ENEMY_ST_CHASE,
+            cfg.ENEMY_ST_SEARCH,
         ):
             if st == cfg.ENEMY_ST_IDLE:
                 continue
